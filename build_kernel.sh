@@ -87,13 +87,38 @@ fi
 echo "==========================================="
 echo " [*] Resolving latest stable NoMount release"
 echo "==========================================="
-NOMOUNT_VERSION="$(curl -fsSL --retry 3 --retry-delay 2 \
-    https://api.github.com/repos/maxsteeel/nomount/releases/latest \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
-if [ -z "$NOMOUNT_VERSION" ]; then
-    echo "[!] Failed to resolve the latest stable NoMount release."
-    exit 1
+# Use the Actions token to avoid unauthenticated GitHub API rate limits.
+# Keep the request usable outside Actions when no token is available.
+NOMOUNT_API_HEADERS=(
+    -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28"
+)
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    NOMOUNT_API_HEADERS+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 fi
+
+NOMOUNT_RESPONSE="$(curl -fsSL --retry 3 --retry-delay 2 \
+    "${NOMOUNT_API_HEADERS[@]}" \
+    https://api.github.com/repos/maxsteeel/nomount/releases/latest)" || {
+    echo "[!] Failed to fetch NoMount release information from GitHub API."
+    echo "[!] Check GITHUB_TOKEN permissions and GitHub API availability."
+    exit 1
+}
+
+NOMOUNT_VERSION="$(printf '%s' "$NOMOUNT_RESPONSE" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"[!] GitHub API returned invalid JSON: {exc}")
+if not isinstance(data, dict) or not data.get("tag_name"):
+    message = data.get("message", "tag_name is missing") if isinstance(data, dict) else "unexpected response"
+    raise SystemExit(f"[!] Cannot resolve NoMount release: {message}")
+print(data["tag_name"])
+')" || {
+    echo "[!] Failed to parse the latest stable NoMount release."
+    exit 1
+}
 echo "[*] Latest stable NoMount release: ${NOMOUNT_VERSION}"
 curl -fsSL --retry 3 --retry-delay 2 \
     "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_VERSION}/kernel/setup.sh" \
