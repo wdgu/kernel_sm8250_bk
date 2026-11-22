@@ -77,6 +77,38 @@ if [ "$ENABLE_KSU" -eq 1 ]; then
     echo "==========================================="
     echo "[*] Downloading and running BakaSU remote setup script..."
     curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+
+    # Keep BakaSU main compatible with the kernel tree's SUSFS v2.3.0.
+    # Newer BakaSU dispatch commands are compiled only when the matching
+    # command IDs are provided by the kernel's SUSFS headers.
+    python3 - <<'PY'
+from pathlib import Path
+
+dispatch = Path("KernelSU/kernel/supercall/dispatch.c")
+source = dispatch.read_text()
+
+compat_cases = {
+    "CMD_SUSFS_SET_SUS_PATH_UID_FILTER": """    case CMD_SUSFS_SET_SUS_PATH_UID_FILTER: {
+        susfs_set_sus_path_uid_filter(arg);
+        return 0;
+    }""",
+    "CMD_SUSFS_SET_PRIORITY_UID_FILTER": """    case CMD_SUSFS_SET_PRIORITY_UID_FILTER: {
+        susfs_set_priority_uid_filter(arg);
+        return 0;
+    }""",
+}
+
+for command, block in compat_cases.items():
+    guarded = f"#ifdef {command}\\n{block}\\n#endif"
+    if guarded in source:
+        continue
+    if block not in source:
+        raise SystemExit(f"[!] Cannot find expected BakaSU dispatch block: {command}")
+    source = source.replace(block, guarded, 1)
+
+dispatch.write_text(source)
+print("[+] Applied compatibility guards for SUSFS commands missing from older headers.")
+PY
     echo "[+] BakaSU setup finished."
 fi
 
