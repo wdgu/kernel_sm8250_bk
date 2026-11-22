@@ -99,7 +99,7 @@ compat_cases = {
 }
 
 for command, block in compat_cases.items():
-    guarded = f"#ifdef {command}\\n{block}\\n#endif"
+    guarded = f"#ifdef {command}\n{block}\n#endif"
     if guarded in source:
         continue
     if block not in source:
