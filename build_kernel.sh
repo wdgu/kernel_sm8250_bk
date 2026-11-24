@@ -77,8 +77,188 @@ if [ "$ENABLE_KSU" -eq 1 ]; then
     echo "==========================================="
     echo "[*] Downloading and running BakaSU remote setup script..."
     curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+
+    # Compatibility layer: use newer SUSFS APIs only when the kernel tree provides them.
+    # Older 4.19 trees (such as this v2.3.0 backport) keep their legacy behavior.
+    python3 - <<'PY'
+from pathlib import Path
+import re
+
+header = Path("include/linux/susfs.h").read_text()
+susfs_source = Path("fs/susfs.c").read_text()
+
+def has_decl(text, name):
+    pattern = rf"(?m)^\s*(?:extern\s+)?(?:static\s+)?(?:inline\s+)?(?:int|void|bool|long)\s+{re.escape(name)}\s*\("
+    return re.search(pattern, text) is not None
+
+def patch_file(path, edits, defines):
+    file = Path(path)
+    source = file.read_text()
+
+    # Add feature macros after the include block. They are intentionally
+    # defined only when the kernel-side API is actually present.
+    if defines:
+        lines = source.splitlines()
+        last_include = max((i for i, line in enumerate(lines) if line.startswith("#include ")), default=-1)
+        if last_include < 0:
+            raise SystemExit(f"[!] No include block found in {path}")
+        for macro in defines:
+            define = f"#define {macro} 1"
+            if define not in source:
+                lines.insert(last_include + 1, define)
+                last_include += 1
+        source = "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+
+    for old_block, new_block, label in edits:
+        if new_block in source:
+            continue
+        if old_block not in source:
+            raise SystemExit(f"[!] Cannot locate expected compatibility site in {path}: {label}")
+        source = source.replace(old_block, new_block, 1)
+
+    file.write_text(source)
+
+# 1) Native SELinux registration exists only in newer SUSFS patch sets.
+# BakaSU already supplies extern declarations, so probe the kernel header
+# and implementation; otherwise retain the legacy policy-generation path.
+selinux_names = (
+    "susfs_add_sus_avd_allowed_by_type",
+    "susfs_add_sus_type",
+)
+selinux_supported = all(
+    has_decl(header, name) and has_decl(susfs_source, name)
+    for name in selinux_names
+)
+selinux_defines = ["KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION"] if selinux_supported else []
+patch_file(
+    "KernelSU/kernel/selinux/sepolicy.c",
+    [
+        (
+            "#ifdef CONFIG_KSU_SUSFS\nextern int susfs_add_sus_avd_allowed_by_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\nextern int susfs_add_sus_avd_allowed_by_type",
+            "SELinux API declarations",
+        ),
+        (
+            "#ifdef CONFIG_KSU_SUSFS\n        susfs_add_sus_avd_allowed_by_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\n        susfs_add_sus_avd_allowed_by_type",
+            "SELinux AV registration",
+        ),
+        (
+            "#ifdef CONFIG_KSU_SUSFS\n    susfs_add_sus_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\n    susfs_add_sus_type",
+            "SELinux type registration",
+        ),
+    ],
+    selinux_defines,
+)
+
+# 2) Optional app UID parsers: enable only when the kernel header declares them.
+priority_supported = (
+    has_decl(header, "susfs_parse_priority_app_strings")
+    and has_decl(susfs_source, "susfs_parse_priority_app_strings")
+)
+sus_path_apps_supported = (
+    has_decl(header, "susfs_parse_sus_path_app_strings")
+    and has_decl(susfs_source, "susfs_parse_sus_path_app_strings")
+)
+tracker_defines = []
+if priority_supported:
+    tracker_defines.append("KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER")
+if sus_path_apps_supported:
+    tracker_defines.append("KSU_SUSFS_COMPAT_HAS_SUS_PATH_APP_PARSER")
+
+patch_file(
+    "KernelSU/kernel/manager/throne_tracker.c",
+    [
+        (
+            "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n    // Refresh after tracking completes, including deferred scans.\n    susfs_parse_priority_app_strings();\n#endif",
+            "#if defined(CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER) && defined(KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER)\n    // Refresh after tracking completes, including deferred scans.\n    susfs_parse_priority_app_strings();\n#endif",
+            "priority UID parser",
+        ),
+        (
+            "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n    // Renew the sus path uid bitmap filter\n    susfs_parse_sus_path_app_strings();\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH",
+            "#if defined(CONFIG_KSU_SUSFS_SUS_PATH) && defined(KSU_SUSFS_COMPAT_HAS_SUS_PATH_APP_PARSER)\n    // Renew the sus path uid bitmap filter\n    susfs_parse_sus_path_app_strings();\n#endif // SUSFS app parser compatibility",
+            "sus path app parser",
+        ),
+    ],
+    tracker_defines,
+)
+
+# 3) New command IDs are compiled only when the matching kernel header defines them.
+dispatch = Path("KernelSU/kernel/supercall/dispatch.c")
+source = dispatch.read_text()
+compat_cases = {
+    "CMD_SUSFS_SET_SUS_PATH_UID_FILTER": """    case CMD_SUSFS_SET_SUS_PATH_UID_FILTER: {
+        susfs_set_sus_path_uid_filter(arg);
+        return 0;
+    }""",
+    "CMD_SUSFS_SET_PRIORITY_UID_FILTER": """    case CMD_SUSFS_SET_PRIORITY_UID_FILTER: {
+        susfs_set_priority_uid_filter(arg);
+        return 0;
+    }""",
+}
+for command, block in compat_cases.items():
+    guarded = f"#ifdef {command}\n{block}\n#endif"
+    if guarded in source:
+        continue
+    if block not in source:
+        raise SystemExit(f"[!] Cannot find expected BakaSU dispatch block: {command}")
+    source = source.replace(block, guarded, 1)
+dispatch.write_text(source)
+
+print("[+] SUSFS compatibility probe:")
+print(f"    Native SELinux registration: {'enabled' if selinux_supported else 'skipped (legacy policy fallback)'}")
+print(f"    Priority UID parser: {'enabled' if priority_supported else 'skipped (not declared by kernel SUSFS)'}")
+print(f"    Sus-path app parser: {'enabled' if sus_path_apps_supported else 'skipped (not declared by kernel SUSFS)'}")
+print("[+] Missing SUSFS command IDs are guarded; supported APIs remain enabled.")
+PY
     echo "[+] BakaSU setup finished."
 fi
+
+# ==========================================
+# NoMount Setup (Linux 4.19 integration)
+# Resolve the latest stable GitHub Release at build time.
+# ==========================================
+echo "==========================================="
+echo " [*] Resolving latest stable NoMount release"
+echo "==========================================="
+# Use the Actions token to avoid unauthenticated GitHub API rate limits.
+# Keep the request usable outside Actions when no token is available.
+NOMOUNT_API_HEADERS=(
+    -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28"
+)
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    NOMOUNT_API_HEADERS+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+fi
+
+NOMOUNT_RESPONSE="$(curl -fsSL --retry 3 --retry-delay 2 \
+    "${NOMOUNT_API_HEADERS[@]}" \
+    https://api.github.com/repos/maxsteeel/nomount/releases/latest)" || {
+    echo "[!] Failed to fetch NoMount release information from GitHub API."
+    echo "[!] Check GITHUB_TOKEN permissions and GitHub API availability."
+    exit 1
+}
+
+NOMOUNT_VERSION="$(printf '%s' "$NOMOUNT_RESPONSE" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"[!] GitHub API returned invalid JSON: {exc}")
+if not isinstance(data, dict) or not data.get("tag_name"):
+    message = data.get("message", "tag_name is missing") if isinstance(data, dict) else "unexpected response"
+    raise SystemExit(f"[!] Cannot resolve NoMount release: {message}")
+print(data["tag_name"])
+')" || {
+    echo "[!] Failed to parse the latest stable NoMount release."
+    exit 1
+}
+echo "[*] Latest stable NoMount release: ${NOMOUNT_VERSION}"
+curl -fsSL --retry 3 --retry-delay 2 \
+    "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_VERSION}/kernel/setup.sh" \
+    | sh -s "${NOMOUNT_VERSION}"
+echo "[+] NoMount ${NOMOUNT_VERSION} setup finished."
 
 # ==========================================
 # Baseband-guard Setup
@@ -204,7 +384,11 @@ build_target() {
     echo "[*] Injecting Baseband-guard configuration..."
     scripts/config --file "${OUT_DIR}/.config" -e BBG
 
-    # 2. KernelSU configurations
+    # 2. NoMount configuration (available with or without KernelSU)
+    echo "[*] Enabling NoMount..."
+    scripts/config --file "${OUT_DIR}/.config" -e NOMOUNT
+
+    # 3. KernelSU configurations
     if [ "$ENABLE_KSU" -eq 1 ]; then
         echo "[*] Injecting BakaSU & SUSFS configurations..."
         scripts/config --file "${OUT_DIR}/.config" \

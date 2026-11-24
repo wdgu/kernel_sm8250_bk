@@ -37,10 +37,13 @@ on:
           - miui
           - both
 
+permissions:
+  contents: read
+
 jobs:
   build-kernel:
     name: Build ${{ github.event.inputs.device }} | KSU:${{ github.event.inputs.ksu }} | OS:${{ github.event.inputs.target_os }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     
     steps:
     - name: Checkout Repository
@@ -74,6 +77,8 @@ jobs:
         tar -zxvf Clang-16.0.6-20260807.tar.gz
 
     - name: Run Build Script
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
       run: |
         chmod +x build_kernel.sh
         
