@@ -78,15 +78,108 @@ if [ "$ENABLE_KSU" -eq 1 ]; then
     echo "[*] Downloading and running BakaSU remote setup script..."
     curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
-    # Keep BakaSU main compatible with the kernel tree's SUSFS v2.3.0.
-    # Newer BakaSU dispatch commands are compiled only when the matching
-    # command IDs are provided by the kernel's SUSFS headers.
+    # Compatibility layer: use newer SUSFS APIs only when the kernel tree provides them.
+    # Older 4.19 trees (such as this v2.3.0 backport) keep their legacy behavior.
     python3 - <<'PY'
 from pathlib import Path
+import re
 
+header = Path("include/linux/susfs.h").read_text()
+susfs_source = Path("fs/susfs.c").read_text()
+api_text = header + "\\n" + susfs_source
+
+def has_api(name):
+    # Match a real declaration or definition, not comments or call sites.
+    pattern = rf"(?m)^\\s*(?:extern\\s+)?(?:static\\s+)?(?:inline\\s+)?(?:int|void|bool|long)\\s+{re.escape(name)}\\s*\\("
+    return re.search(pattern, api_text) is not None
+
+def patch_file(path, edits, defines):
+    file = Path(path)
+    source = file.read_text()
+
+    # Add feature macros after the include block. They are intentionally
+    # defined only when the kernel-side API is actually present.
+    if defines:
+        marker = "#include "
+        lines = source.splitlines()
+        last_include = max((i for i, line in enumerate(lines) if line.startswith(marker)), default=-1)
+        if last_include < 0:
+            raise SystemExit(f"[!] No include block found in {path}")
+        for macro in defines:
+            define = f"#define {macro} 1"
+            if define not in source:
+                lines.insert(last_include + 1, define)
+                last_include += 1
+        source = "\\n".join(lines) + ("\\n" if source.endswith("\\n") else "")
+
+    for old_block, new_block, label in edits:
+        if new_block in source:
+            continue
+        if old_block not in source:
+            raise SystemExit(f"[!] Cannot locate expected compatibility site in {path}: {label}")
+        source = source.replace(old_block, new_block, 1)
+
+    file.write_text(source)
+
+# 1) SELinux registration was introduced after the kernel tree's SUSFS v2.3.0.
+# Keep it enabled when both native APIs exist; otherwise retain the old policy path.
+selinux_supported = all(has_api(name) for name in (
+    "susfs_add_sus_avd_allowed_by_type",
+    "susfs_add_sus_type",
+))
+selinux_defines = ["KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION"] if selinux_supported else []
+patch_file(
+    "KernelSU/kernel/selinux/sepolicy.c",
+    [
+        (
+            "#ifdef CONFIG_KSU_SUSFS\\nextern int susfs_add_sus_avd_allowed_by_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\\nextern int susfs_add_sus_avd_allowed_by_type",
+            "SELinux API declarations",
+        ),
+        (
+            "#ifdef CONFIG_KSU_SUSFS\\n        susfs_add_sus_avd_allowed_by_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\\n        susfs_add_sus_avd_allowed_by_type",
+            "SELinux AV registration",
+        ),
+        (
+            "#ifdef CONFIG_KSU_SUSFS\\n    susfs_add_sus_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\\n    susfs_add_sus_type",
+            "SELinux type registration",
+        ),
+    ],
+    selinux_defines,
+)
+
+# 2) App UID parser helpers are optional in older SUSFS backports.
+# Preserve the parser calls when the kernel declares the corresponding APIs.
+priority_supported = has_api("susfs_parse_priority_app_strings")
+sus_path_apps_supported = has_api("susfs_parse_sus_path_app_strings")
+tracker_defines = []
+if priority_supported:
+    tracker_defines.append("KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER")
+if sus_path_apps_supported:
+    tracker_defines.append("KSU_SUSFS_COMPAT_HAS_SUS_PATH_APP_PARSER")
+
+patch_file(
+    "KernelSU/kernel/manager/throne_tracker.c",
+    [
+        (
+            "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\\n    // Refresh after tracking completes, including deferred scans.\\n    susfs_parse_priority_app_strings();\\n#endif",
+            "#if defined(CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER) && defined(KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER)\\n    // Refresh after tracking completes, including deferred scans.\\n    susfs_parse_priority_app_strings();\\n#endif",
+            "priority UID parser",
+        ),
+        (
+            "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\\n    // Renew the sus path uid bitmap filter\\n    susfs_parse_sus_path_app_strings();\\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH",
+            "#if defined(CONFIG_KSU_SUSFS_SUS_PATH) && defined(KSU_SUSFS_COMPAT_HAS_SUS_PATH_APP_PARSER)\\n    // Renew the sus path uid bitmap filter\\n    susfs_parse_sus_path_app_strings();\\n#endif // SUSFS app parser compatibility",
+            "sus path app parser",
+        ),
+    ],
+    tracker_defines,
+)
+
+# 3) New command IDs are compiled only when the matching kernel header defines them.
 dispatch = Path("KernelSU/kernel/supercall/dispatch.c")
 source = dispatch.read_text()
-
 compat_cases = {
     "CMD_SUSFS_SET_SUS_PATH_UID_FILTER": """    case CMD_SUSFS_SET_SUS_PATH_UID_FILTER: {
         susfs_set_sus_path_uid_filter(arg);
@@ -97,17 +190,20 @@ compat_cases = {
         return 0;
     }""",
 }
-
 for command, block in compat_cases.items():
-    guarded = f"#ifdef {command}\n{block}\n#endif"
+    guarded = f"#ifdef {command}\\n{block}\\n#endif"
     if guarded in source:
         continue
     if block not in source:
         raise SystemExit(f"[!] Cannot find expected BakaSU dispatch block: {command}")
     source = source.replace(block, guarded, 1)
-
 dispatch.write_text(source)
-print("[+] Applied compatibility guards for SUSFS commands missing from older headers.")
+
+print("[+] SUSFS compatibility probe:")
+print(f"    Native SELinux registration: {'enabled' if selinux_supported else 'skipped (legacy policy fallback)'}")
+print(f"    Priority UID parser: {'enabled' if priority_supported else 'skipped (not in kernel SUSFS)'}")
+print(f"    Sus-path app parser: {'enabled' if sus_path_apps_supported else 'skipped (not in kernel SUSFS)'}")
+print("[+] Missing SUSFS command IDs are guarded; supported APIs remain enabled.")
 PY
     echo "[+] BakaSU setup finished."
 fi
