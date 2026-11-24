@@ -126,7 +126,7 @@ selinux_names = (
     "susfs_add_sus_type",
 )
 selinux_supported = all(
-    has_decl(header, name) or has_decl(susfs_source, name)
+    has_decl(header, name) and has_decl(susfs_source, name)
     for name in selinux_names
 )
 selinux_defines = ["KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION"] if selinux_supported else []
@@ -153,8 +153,14 @@ patch_file(
 )
 
 # 2) Optional app UID parsers: enable only when the kernel header declares them.
-priority_supported = has_decl(header, "susfs_parse_priority_app_strings")
-sus_path_apps_supported = has_decl(header, "susfs_parse_sus_path_app_strings")
+priority_supported = (
+    has_decl(header, "susfs_parse_priority_app_strings")
+    and has_decl(susfs_source, "susfs_parse_priority_app_strings")
+)
+sus_path_apps_supported = (
+    has_decl(header, "susfs_parse_sus_path_app_strings")
+    and has_decl(susfs_source, "susfs_parse_sus_path_app_strings")
+)
 tracker_defines = []
 if priority_supported:
     tracker_defines.append("KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER")
