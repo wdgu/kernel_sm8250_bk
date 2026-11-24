@@ -86,12 +86,10 @@ import re
 
 header = Path("include/linux/susfs.h").read_text()
 susfs_source = Path("fs/susfs.c").read_text()
-api_text = header + "\\n" + susfs_source
 
-def has_api(name):
-    # Match a real declaration or definition, not comments or call sites.
-    pattern = rf"(?m)^\\s*(?:extern\\s+)?(?:static\\s+)?(?:inline\\s+)?(?:int|void|bool|long)\\s+{re.escape(name)}\\s*\\("
-    return re.search(pattern, api_text) is not None
+def has_decl(text, name):
+    pattern = rf"(?m)^\s*(?:extern\s+)?(?:static\s+)?(?:inline\s+)?(?:int|void|bool|long)\s+{re.escape(name)}\s*\("
+    return re.search(pattern, text) is not None
 
 def patch_file(path, edits, defines):
     file = Path(path)
@@ -100,9 +98,8 @@ def patch_file(path, edits, defines):
     # Add feature macros after the include block. They are intentionally
     # defined only when the kernel-side API is actually present.
     if defines:
-        marker = "#include "
         lines = source.splitlines()
-        last_include = max((i for i, line in enumerate(lines) if line.startswith(marker)), default=-1)
+        last_include = max((i for i, line in enumerate(lines) if line.startswith("#include ")), default=-1)
         if last_include < 0:
             raise SystemExit(f"[!] No include block found in {path}")
         for macro in defines:
@@ -110,7 +107,7 @@ def patch_file(path, edits, defines):
             if define not in source:
                 lines.insert(last_include + 1, define)
                 last_include += 1
-        source = "\\n".join(lines) + ("\\n" if source.endswith("\\n") else "")
+        source = "\n".join(lines) + ("\n" if source.endswith("\n") else "")
 
     for old_block, new_block, label in edits:
         if new_block in source:
@@ -121,39 +118,43 @@ def patch_file(path, edits, defines):
 
     file.write_text(source)
 
-# 1) SELinux registration was introduced after the kernel tree's SUSFS v2.3.0.
-# Keep it enabled when both native APIs exist; otherwise retain the old policy path.
-selinux_supported = all(has_api(name) for name in (
+# 1) Native SELinux registration exists only in newer SUSFS patch sets.
+# BakaSU already supplies extern declarations, so probe the kernel header
+# and implementation; otherwise retain the legacy policy-generation path.
+selinux_names = (
     "susfs_add_sus_avd_allowed_by_type",
     "susfs_add_sus_type",
-))
+)
+selinux_supported = all(
+    has_decl(header, name) or has_decl(susfs_source, name)
+    for name in selinux_names
+)
 selinux_defines = ["KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION"] if selinux_supported else []
 patch_file(
     "KernelSU/kernel/selinux/sepolicy.c",
     [
         (
-            "#ifdef CONFIG_KSU_SUSFS\\nextern int susfs_add_sus_avd_allowed_by_type",
-            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\\nextern int susfs_add_sus_avd_allowed_by_type",
+            "#ifdef CONFIG_KSU_SUSFS\nextern int susfs_add_sus_avd_allowed_by_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\nextern int susfs_add_sus_avd_allowed_by_type",
             "SELinux API declarations",
         ),
         (
-            "#ifdef CONFIG_KSU_SUSFS\\n        susfs_add_sus_avd_allowed_by_type",
-            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\\n        susfs_add_sus_avd_allowed_by_type",
+            "#ifdef CONFIG_KSU_SUSFS\n        susfs_add_sus_avd_allowed_by_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\n        susfs_add_sus_avd_allowed_by_type",
             "SELinux AV registration",
         ),
         (
-            "#ifdef CONFIG_KSU_SUSFS\\n    susfs_add_sus_type",
-            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\\n    susfs_add_sus_type",
+            "#ifdef CONFIG_KSU_SUSFS\n    susfs_add_sus_type",
+            "#if defined(CONFIG_KSU_SUSFS) && defined(KSU_SUSFS_COMPAT_HAS_SELINUX_REGISTRATION)\n    susfs_add_sus_type",
             "SELinux type registration",
         ),
     ],
     selinux_defines,
 )
 
-# 2) App UID parser helpers are optional in older SUSFS backports.
-# Preserve the parser calls when the kernel declares the corresponding APIs.
-priority_supported = has_api("susfs_parse_priority_app_strings")
-sus_path_apps_supported = has_api("susfs_parse_sus_path_app_strings")
+# 2) Optional app UID parsers: enable only when the kernel header declares them.
+priority_supported = has_decl(header, "susfs_parse_priority_app_strings")
+sus_path_apps_supported = has_decl(header, "susfs_parse_sus_path_app_strings")
 tracker_defines = []
 if priority_supported:
     tracker_defines.append("KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER")
@@ -164,13 +165,13 @@ patch_file(
     "KernelSU/kernel/manager/throne_tracker.c",
     [
         (
-            "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\\n    // Refresh after tracking completes, including deferred scans.\\n    susfs_parse_priority_app_strings();\\n#endif",
-            "#if defined(CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER) && defined(KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER)\\n    // Refresh after tracking completes, including deferred scans.\\n    susfs_parse_priority_app_strings();\\n#endif",
+            "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n    // Refresh after tracking completes, including deferred scans.\n    susfs_parse_priority_app_strings();\n#endif",
+            "#if defined(CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER) && defined(KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER)\n    // Refresh after tracking completes, including deferred scans.\n    susfs_parse_priority_app_strings();\n#endif",
             "priority UID parser",
         ),
         (
-            "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\\n    // Renew the sus path uid bitmap filter\\n    susfs_parse_sus_path_app_strings();\\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH",
-            "#if defined(CONFIG_KSU_SUSFS_SUS_PATH) && defined(KSU_SUSFS_COMPAT_HAS_SUS_PATH_APP_PARSER)\\n    // Renew the sus path uid bitmap filter\\n    susfs_parse_sus_path_app_strings();\\n#endif // SUSFS app parser compatibility",
+            "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n    // Renew the sus path uid bitmap filter\n    susfs_parse_sus_path_app_strings();\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH",
+            "#if defined(CONFIG_KSU_SUSFS_SUS_PATH) && defined(KSU_SUSFS_COMPAT_HAS_SUS_PATH_APP_PARSER)\n    // Renew the sus path uid bitmap filter\n    susfs_parse_sus_path_app_strings();\n#endif // SUSFS app parser compatibility",
             "sus path app parser",
         ),
     ],
@@ -191,7 +192,7 @@ compat_cases = {
     }""",
 }
 for command, block in compat_cases.items():
-    guarded = f"#ifdef {command}\\n{block}\\n#endif"
+    guarded = f"#ifdef {command}\n{block}\n#endif"
     if guarded in source:
         continue
     if block not in source:
@@ -201,8 +202,8 @@ dispatch.write_text(source)
 
 print("[+] SUSFS compatibility probe:")
 print(f"    Native SELinux registration: {'enabled' if selinux_supported else 'skipped (legacy policy fallback)'}")
-print(f"    Priority UID parser: {'enabled' if priority_supported else 'skipped (not in kernel SUSFS)'}")
-print(f"    Sus-path app parser: {'enabled' if sus_path_apps_supported else 'skipped (not in kernel SUSFS)'}")
+print(f"    Priority UID parser: {'enabled' if priority_supported else 'skipped (not declared by kernel SUSFS)'}")
+print(f"    Sus-path app parser: {'enabled' if sus_path_apps_supported else 'skipped (not declared by kernel SUSFS)'}")
 print("[+] Missing SUSFS command IDs are guarded; supported APIs remain enabled.")
 PY
     echo "[+] BakaSU setup finished."
