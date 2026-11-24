@@ -88,7 +88,7 @@ header = Path("include/linux/susfs.h").read_text()
 susfs_source = Path("fs/susfs.c").read_text()
 
 def has_decl(text, name):
-    pattern = rf"(?m)^\s*(?:extern\s+)?(?:static\s+)?(?:inline\s+)?(?:int|void|bool|long)\s+{re.escape(name)}\s*\("
+    pattern = rf"(?m)^\s*(?:extern\s+)?(?:inline\s+)?(?:int|void|bool|long)\s+{re.escape(name)}\s*\("
     return re.search(pattern, text) is not None
 
 def patch_file(path, edits, defines):
