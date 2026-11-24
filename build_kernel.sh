@@ -161,6 +161,13 @@ sus_path_apps_supported = (
     has_decl(header, "susfs_parse_sus_path_app_strings")
     and has_decl(susfs_source, "susfs_parse_sus_path_app_strings")
 )
+
+# Do not advertise the priority UID feature when its kernel-side API is absent.
+priority_marker = Path(".ksu_susfs_disable_priority_uid_filter")
+priority_marker.unlink(missing_ok=True)
+if not priority_supported:
+    priority_marker.touch()
+
 tracker_defines = []
 if priority_supported:
     tracker_defines.append("KSU_SUSFS_COMPAT_HAS_PRIORITY_UID_PARSER")
@@ -395,6 +402,10 @@ build_target() {
             -e KSU \
             -e THREAD_INFO_IN_TASK \
             -e KSU_SUSFS
+        if [ -f ".ksu_susfs_disable_priority_uid_filter" ]; then
+            echo "[!] SUSFS priority UID API is unavailable; disabling KSU_SUSFS_PRIORITY_UID_FILTER."
+            scripts/config --file "${OUT_DIR}/.config" -d KSU_SUSFS_PRIORITY_UID_FILTER
+        fi
     fi
 
     # 3. MIUI configurations
